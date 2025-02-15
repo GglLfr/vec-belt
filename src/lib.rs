@@ -467,6 +467,28 @@ unsafe impl<T: Copy> Transfer<T> for std::slice::Iter<'_, T> {
     }
 }
 
+/// Create a manually-implemented [`Transfer`] with a length and a transferer closure.
+///
+/// # Safety
+/// See the safety documents of [`Transfer`].
+#[inline]
+pub unsafe fn transfer<T>(len: usize, transfer: impl FnOnce(*mut T)) -> impl Transfer<T> {
+    struct Driver<T, F: FnOnce(*mut T)>(usize, F, PhantomData<fn(*mut T)>);
+    unsafe impl<T, F: FnOnce(*mut T)> Transfer<T> for Driver<T, F> {
+        #[inline]
+        fn len(&self) -> usize {
+            self.0
+        }
+
+        #[inline]
+        unsafe fn transfer(self, _: usize, dst: *mut T) {
+            self.1(dst)
+        }
+    }
+
+    Driver(len, transfer, PhantomData)
+}
+
 /// An owned slice created by [`VecBelt::append`]. Unconsumed elements will be dropped.
 pub struct ConsumeSlice<'a, T> {
     /// Slice returned by [`VecBelt::append_raw`].

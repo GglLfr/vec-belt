@@ -2,7 +2,7 @@
 name = "vec-belt"
 description = "Multi-threaded bulk-append, single-threaded consume `Vec<T>`."
 authors = ["GlFolker"]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 exclude = [
     "benches",
