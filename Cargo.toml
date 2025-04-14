@@ -2,8 +2,8 @@
 name = "vec-belt"
 description = "Multi-threaded bulk-append, single-threaded consume `Vec<T>`."
 authors = ["GlFolker"]
-version = "1.1.0"
-edition = "2021"
+version = "1.2.0"
+edition = "2024"
 exclude = [
     "benches",
     "bench_result",
@@ -12,8 +12,12 @@ exclude = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GlennFolker/vec-belt"
 
+[features]
+default = ["std"]
+std = ["crossbeam-utils/std"]
+
 [dependencies]
-crossbeam-utils = "0.8"
+crossbeam-utils = { version = "0.8", default-features = false }
 likely_stable = "0.1"
 
 [dev-dependencies]

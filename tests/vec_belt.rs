@@ -19,9 +19,7 @@ fn test_vec_belt() {
     let vec = Arc::new(VecBelt::new(1));
     let threads = (0..thread_count)
         .zip(repeat_with(|| vec.clone()))
-        .map(|(i, vec)| {
-            std::thread::spawn(move || vec.append(append.map(|num| Int(num + i * append.len()))))
-        })
+        .map(|(i, vec)| std::thread::spawn(move || vec.append(append.map(|num| Int(num + i * append.len())))))
         .collect::<Box<_>>();
 
     for thread in threads {

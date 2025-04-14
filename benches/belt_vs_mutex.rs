@@ -1,14 +1,12 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering::*},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering::*},
     },
     thread::JoinHandle,
 };
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, Bencher, BenchmarkId, Criterion,
-};
+use criterion::{BatchSize, Bencher, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use vec_belt::VecBelt;
 
 const INITIAL_LEN: usize = 32768;
@@ -36,9 +34,7 @@ fn bench_vec_mutex(bench: &mut Bencher, thread_count: usize, append_count: usize
 
             let threads = (0..thread_count)
                 .map(|i| {
-                    let input = (0..data_len)
-                        .map(|num| num + i * data_len)
-                        .collect::<Box<_>>();
+                    let input = (0..data_len).map(|num| num + i * data_len).collect::<Box<_>>();
                     let main_thread = main_thread.clone();
                     let data = data.clone();
                     let signal = signal.clone();
@@ -105,9 +101,7 @@ fn bench_vec_belt(bench: &mut Bencher, thread_count: usize, append_count: usize,
 
             let threads = (0..thread_count)
                 .map(|i| {
-                    let input = (0..data_len)
-                        .map(|num| num + i * data_len)
-                        .collect::<Box<_>>();
+                    let input = (0..data_len).map(|num| num + i * data_len).collect::<Box<_>>();
                     let main_thread = main_thread.clone();
                     let data = data.clone();
                     let signal = signal.clone();

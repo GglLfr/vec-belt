@@ -2,20 +2,26 @@
 #![cfg_attr(docsrs, feature(rustdoc_internals))]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(doc, deny(missing_docs))]
+#![no_std]
+extern crate alloc;
 
-use std::{
-    alloc::{alloc, dealloc, handle_alloc_error, Layout, LayoutError},
+use alloc::{
+    alloc::{Layout, LayoutError, alloc, dealloc, handle_alloc_error},
+    boxed::Box,
+    vec::Vec,
+};
+use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::{Deref, DerefMut},
     panic::{RefUnwindSafe, UnwindSafe},
-    ptr::{addr_eq, null_mut, slice_from_raw_parts, slice_from_raw_parts_mut, NonNull},
+    ptr::{NonNull, addr_eq, null_mut, slice_from_raw_parts, slice_from_raw_parts_mut},
     sync::atomic::{AtomicUsize, Ordering::*},
 };
 
 use crossbeam_utils::{Backoff, CachePadded};
-use likely_stable::{likely, unlikely, LikelyResult};
+use likely_stable::{LikelyResult, likely, unlikely};
 
 /// Most significant bit used as a resource acquisition flag.
 const FLAG: usize = 1 << (usize::BITS - 1);
@@ -62,7 +68,7 @@ impl<T> Fragment<T> {
         // Initialize fields accordingly.
         unsafe {
             (&raw mut (*ptr).next).write(slice_from_raw_parts_mut(null_mut::<()>(), 0) as *mut Self);
-            (&raw mut (*ptr).len).write(0);
+            (&raw mut (*ptr).len).write(0)
         }
 
         Ok(unsafe { (NonNull::new_unchecked(ptr), &raw mut (*ptr).data as *mut T) })
@@ -76,7 +82,7 @@ impl<T> Fragment<T> {
 pub struct VecBelt<T> {
     /// The total length of all fragments before the tail. This is used to offset the current total
     /// length to reside within the tail fragment.
-    preceeding_len: UnsafeCell<usize>,
+    preceding_len: UnsafeCell<usize>,
     /// The synchronization primitive, contains the current total length and an [acquisition
     /// bit](FLAG).
     len: CachePadded<AtomicUsize>,
@@ -105,7 +111,7 @@ impl<T> VecBelt<T> {
     pub fn new(initial_size: usize) -> Self {
         let (head, ..) = Fragment::new(initial_size).expect("couldn't allocate a fragment");
         Self {
-            preceeding_len: UnsafeCell::new(0),
+            preceding_len: UnsafeCell::new(0),
             len: CachePadded::new(AtomicUsize::new(0)),
             head,
             tail: UnsafeCell::new(head),
@@ -144,70 +150,74 @@ impl<T> VecBelt<T> {
     /// `additional` must be less or equal to [`isize::MAX`].
     unsafe fn append_raw_erased(&self, additional: usize) -> (*mut T, usize) {
         let backoff = Backoff::new();
-        let preceeding_len = self.preceeding_len.get();
+        let preceding_len = self.preceding_len.get();
         let tail = self.tail.get();
 
-        loop {
-            // Queries the current length of the vector, ignoring the flag.
-            let len = self.len.load(Relaxed) & MASK;
-            let new_len = len.unchecked_add(additional);
+        return loop {
+            unsafe {
+                // Queries the current length of the vector, ignoring the flag.
+                let len = self.len.load(Relaxed) & MASK;
+                let new_len = len.unchecked_add(additional);
 
-            if unlikely(new_len & FLAG == FLAG) {
-                panic!("too many elements")
-            }
-
-            // If the current length is exactly `len` without the flag, then store it as `new_len` with the
-            // flag, momentarily locking the vector...
-            if self.len.compare_exchange(len, new_len | FLAG, Acquire, Relaxed).is_err() {
-                // ...otherwise, we need to wait for the other worker to finish unlocking.
-                backoff.snooze();
-                continue;
-            }
-
-            // `self.len` is the absolute total length, while we want an index relative to the current tail
-            // fragment's starting index. This is done by reading `preceeding` and subtracting `len` with it.
-            let preceeding = *preceeding_len;
-            let data = &raw mut (*(*tail).as_ptr()).data;
-
-            if likely(data.len() >= new_len - preceeding) {
-                // Immediately release the lock, because the fragment fits and the data slice we requested is
-                // guaranteed not to be aliased by this atomic store.
-                self.len.store(new_len, Release);
-                break ((data as *mut T).add(len - preceeding), len)
-            } else {
-                // Try to allocate a new fragment and linking to it, releasing the lock as soon as possible.
-                break new_fragment(len, additional, preceeding, preceeding_len, &self.len, tail);
-
-                #[cold]
-                unsafe fn new_fragment<T>(
-                    len: usize,
-                    additional: usize,
-                    preceeding: usize,
-                    this_preceeding_len: *mut usize,
-                    this_len: &AtomicUsize,
-                    this_tail: *mut NonNull<Fragment<T>>,
-                ) -> (*mut T, usize) {
-                    // First, allocate a new fragment that fits...
-                    let (new_tail, new_data) = Fragment::<T>::new(len + additional).unwrap_or_else_likely(|_| {
-                        this_len.store(len, Release);
-                        panic!("couldn't allocate a fragment");
-                    });
-
-                    // ...then, write `preceeding_len` to the current length and `tail` to the new pointer.
-                    this_preceeding_len.replace(len);
-                    let tail = this_tail.replace(new_tail).as_ptr();
-
-                    // Immediately release the lock so other threads can continue working.
-                    this_len.store(len + additional, Release);
-
-                    // These fields aren't written within the lock because we know subsequent operations will not ever
-                    // access this fragment in particular, therefore eliminating mutable aliasing.
-                    (&raw mut (*tail).next).write(new_tail.as_ptr());
-                    (&raw mut (*tail).len).write(len - preceeding);
-
-                    (new_data, len)
+                if unlikely(new_len & FLAG == FLAG) {
+                    panic!("too many elements")
                 }
-            };
+
+                // If the current length is exactly `len` without the flag, then store it as `new_len` with the
+                // flag, momentarily locking the vector...
+                if self.len.compare_exchange(len, new_len | FLAG, Acquire, Relaxed).is_err() {
+                    // ...otherwise, we need to wait for the other worker to finish unlocking.
+                    backoff.snooze();
+                    continue
+                }
+
+                // `self.len` is the absolute total length, while we want an index relative to the current tail
+                // fragment's starting index. This is done by reading `preceding` and subtracting `len` with it.
+                let preceding = *preceding_len;
+                let data = &raw mut (*(*tail).as_ptr()).data;
+
+                if likely(data.len() >= new_len - preceding) {
+                    // Immediately release the lock, because the fragment fits and the data slice we requested is
+                    // guaranteed not to be aliased by this atomic store.
+                    self.len.store(new_len, Release);
+                    break ((data as *mut T).add(len - preceding), len)
+                } else {
+                    // Try to allocate a new fragment and linking to it, releasing the lock as soon as possible.
+                    break new_fragment(len, additional, preceding, preceding_len, &self.len, tail)
+                }
+            }
+        };
+
+        #[cold]
+        unsafe fn new_fragment<T>(
+            len: usize,
+            additional: usize,
+            preceding: usize,
+            this_preceding_len: *mut usize,
+            this_len: &AtomicUsize,
+            this_tail: *mut NonNull<Fragment<T>>,
+        ) -> (*mut T, usize) {
+            // First, allocate a new fragment that fits...
+            let (new_tail, new_data) = Fragment::<T>::new(len + additional).unwrap_or_else_likely(|_| {
+                this_len.store(len, Release);
+                panic!("couldn't allocate a fragment")
+            });
+
+            unsafe {
+                // ...then, write `preceding_len` to the current length and `tail` to the new pointer.
+                this_preceding_len.replace(len);
+                let tail = this_tail.replace(new_tail).as_ptr();
+
+                // Immediately release the lock so other threads can continue working.
+                this_len.store(len + additional, Release);
+
+                // These fields aren't written within the lock because we know subsequent operations will not ever
+                // access this fragment in particular, therefore eliminating mutable aliasing.
+                (&raw mut (*tail).next).write(new_tail.as_ptr());
+                (&raw mut (*tail).len).write(len - preceding)
+            }
+
+            (new_data, len)
         }
     }
 
@@ -221,7 +231,7 @@ impl<T> VecBelt<T> {
     ///   **undefined behavior** due to uninitialized elements present.
     #[inline]
     pub unsafe fn append_raw(&self, additional: usize, acceptor: impl FnOnce(*mut T)) -> usize {
-        let (data, index) = self.append_raw_erased(additional);
+        let (data, index) = unsafe { self.append_raw_erased(additional) };
 
         acceptor(data);
         index
@@ -242,16 +252,16 @@ impl<T> VecBelt<T> {
     /// and clears the vector.
     #[inline]
     pub fn clear<'a, R>(&'a mut self, consumer: impl FnOnce(ConsumeSlice<'a, T>) -> R) -> R {
-        // First, get and replace both `preceeding` and `current` to `0`, marking the vector empty.
-        let preceeding = std::mem::replace(self.preceeding_len.get_mut(), 0);
-        let current = std::mem::replace(self.len.get_mut(), 0);
+        // First, get and replace both `preceding` and `current` to `0`, marking the vector empty.
+        let preceding = core::mem::replace(self.preceding_len.get_mut(), 0);
+        let current = core::mem::replace(self.len.get_mut(), 0);
 
         // If the head and tail points to the same fragment, then the vector is already flattened.
         let head = self.head.as_ptr();
         let slice = if likely(addr_eq(head, self.tail.get_mut().as_ptr())) {
             slice_from_raw_parts_mut(unsafe { &raw mut (*head).data as *mut T }, current)
         } else {
-            unsafe { merge(&mut self.head, self.tail.get_mut(), preceeding, current) }
+            unsafe { merge(&mut self.head, self.tail.get_mut(), preceding, current) }
         };
 
         return consumer(ConsumeSlice {
@@ -263,7 +273,7 @@ impl<T> VecBelt<T> {
         unsafe fn merge<T>(
             head: &mut NonNull<Fragment<T>>,
             tail: &mut NonNull<Fragment<T>>,
-            preceeding: usize,
+            preceding: usize,
             current: usize,
         ) -> *mut [T] {
             // First, allocate a fragment that fits the current total length...
@@ -272,30 +282,32 @@ impl<T> VecBelt<T> {
 
             // ...then, replace the head and tail pointer with this new fragment...
             let start_data = new_data;
-            let mut node = std::mem::replace(head, new_head).as_ptr();
+            let mut node = core::mem::replace(head, new_head).as_ptr();
             *tail = new_head;
 
             // ...and finally, collect and deallocate all fragments.
             loop {
-                let next = (*node).next;
-                let data = &raw const (*node).data;
+                unsafe {
+                    let next = (*node).next;
+                    let data = &raw const (*node).data;
 
-                // `next.is_null()` implies `append()` hasn't written to `node->len` yet, so we have to rely on the
-                // current total length subtracted the preceeding fragments' total length.
-                let len = if next.is_null() { current - preceeding } else { (*node).len };
+                    // `next.is_null()` implies `append()` hasn't written to `node->len` yet, so we have to rely on the
+                    // current total length subtracted the preceding fragments' total length.
+                    let len = if next.is_null() { current - preceding } else { (*node).len };
 
-                // Copy the data to the new fragment without dropping anything.
-                new_data.copy_from_nonoverlapping(data as *const T, len);
-                new_data = new_data.add(len);
+                    // Copy the data to the new fragment without dropping anything.
+                    new_data.copy_from_nonoverlapping(data as *const T, len);
+                    new_data = new_data.add(len);
 
-                // Deallocate the fragment. `unwrap_unchecked()` is safe here, because if a fragment has been
-                // allocated by such a layout, then the same layout may be created again with no issue.
-                dealloc(node as *mut u8, Fragment::<T>::layout(data.len()).unwrap_unchecked());
-                node = match next {
-                    // If this is the last fragment, return the fully initialized memory slice ready to be used.
-                    ptr if ptr.is_null() => break slice_from_raw_parts_mut(start_data, current),
-                    ptr => ptr,
-                };
+                    // Deallocate the fragment. `unwrap_unchecked()` is safe here, because if a fragment has been
+                    // allocated by such a layout, then the same layout may be created again with no issue.
+                    dealloc(node as *mut u8, Fragment::<T>::layout(data.len()).unwrap_unchecked());
+                    node = match next {
+                        // If this is the last fragment, return the fully initialized memory slice ready to be used.
+                        ptr if ptr.is_null() => break slice_from_raw_parts_mut(start_data, current),
+                        ptr => ptr,
+                    };
+                }
             }
         }
     }
@@ -303,7 +315,7 @@ impl<T> VecBelt<T> {
 
 impl<T> Drop for VecBelt<T> {
     fn drop(&mut self) {
-        let preceeding = *self.preceeding_len.get_mut();
+        let preceeding = *self.preceding_len.get_mut();
         let current = *self.len.get_mut();
         let mut node = self.head.as_ptr();
 
@@ -313,11 +325,7 @@ impl<T> Drop for VecBelt<T> {
 
             // `next.is_null()` implies `append()` hasn't written to `node->len` yet, so we have to rely on the
             // current total length subtracted the preceeding fragments' total length.
-            let taken = if next.is_null() {
-                current - preceeding
-            } else {
-                unsafe { (*node).len }
-            };
+            let taken = if next.is_null() { current - preceeding } else { unsafe { (*node).len } };
 
             unsafe {
                 // Drop `taken` elements starting from the first index in the fragment, as the rest of the data are
@@ -371,12 +379,12 @@ unsafe impl<T, const LEN: usize> Transfer<T> for [T; LEN] {
 
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_ptr(), len);
-        std::mem::forget(self);
+        unsafe { dst.copy_from_nonoverlapping(self.as_ptr(), len) }
+        core::mem::forget(self)
     }
 }
 
-unsafe impl<T, const LEN: usize> Transfer<T> for std::array::IntoIter<T, LEN> {
+unsafe impl<T, const LEN: usize> Transfer<T> for core::array::IntoIter<T, LEN> {
     #[inline]
     fn len(&self) -> usize {
         LEN
@@ -384,8 +392,8 @@ unsafe impl<T, const LEN: usize> Transfer<T> for std::array::IntoIter<T, LEN> {
 
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len);
-        self.for_each(std::mem::forget);
+        unsafe { dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len) }
+        self.for_each(core::mem::forget)
     }
 }
 
@@ -398,9 +406,11 @@ unsafe impl<T> Transfer<T> for Box<[T]> {
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
         let ptr = Box::into_raw(self);
-        dst.copy_from_nonoverlapping(ptr as *const T, len);
 
-        drop(Box::from_raw(ptr as *mut MaybeUninit<T>));
+        unsafe {
+            dst.copy_from_nonoverlapping(ptr as *const T, len);
+            _ = Box::from_raw(ptr as *mut MaybeUninit<T>)
+        }
     }
 }
 
@@ -412,12 +422,14 @@ unsafe impl<T> Transfer<T> for Vec<T> {
 
     #[inline]
     unsafe fn transfer(mut self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_ptr(), len);
-        self.set_len(0);
+        unsafe {
+            dst.copy_from_nonoverlapping(self.as_ptr(), len);
+            self.set_len(0)
+        }
     }
 }
 
-unsafe impl<T> Transfer<T> for std::vec::IntoIter<T> {
+unsafe impl<T> Transfer<T> for alloc::vec::IntoIter<T> {
     #[inline]
     fn len(&self) -> usize {
         <Self as ExactSizeIterator>::len(self)
@@ -425,12 +437,14 @@ unsafe impl<T> Transfer<T> for std::vec::IntoIter<T> {
 
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len);
-        self.for_each(std::mem::forget);
+        unsafe {
+            dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len);
+            self.for_each(core::mem::forget)
+        }
     }
 }
 
-unsafe impl<T> Transfer<T> for std::vec::Drain<'_, T> {
+unsafe impl<T> Transfer<T> for alloc::vec::Drain<'_, T> {
     #[inline]
     fn len(&self) -> usize {
         <Self as ExactSizeIterator>::len(self)
@@ -438,8 +452,10 @@ unsafe impl<T> Transfer<T> for std::vec::Drain<'_, T> {
 
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len);
-        self.for_each(std::mem::forget);
+        unsafe {
+            dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len);
+            self.for_each(core::mem::forget)
+        }
     }
 }
 
@@ -451,11 +467,11 @@ unsafe impl<T: Copy> Transfer<T> for &[T] {
 
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_ptr(), len);
+        unsafe { dst.copy_from_nonoverlapping(self.as_ptr(), len) }
     }
 }
 
-unsafe impl<T: Copy> Transfer<T> for std::slice::Iter<'_, T> {
+unsafe impl<T: Copy> Transfer<T> for core::slice::Iter<'_, T> {
     #[inline]
     fn len(&self) -> usize {
         <Self as ExactSizeIterator>::len(self)
@@ -463,7 +479,7 @@ unsafe impl<T: Copy> Transfer<T> for std::slice::Iter<'_, T> {
 
     #[inline]
     unsafe fn transfer(self, len: usize, dst: *mut T) {
-        dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len);
+        unsafe { dst.copy_from_nonoverlapping(self.as_slice().as_ptr(), len) }
     }
 }
 
@@ -621,7 +637,7 @@ impl<T> Drop for ConsumeIter<'_, T> {
 
 impl<'a, T> IntoIterator for &'a ConsumeSlice<'a, T> {
     type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
+    type IntoIter = core::slice::Iter<'a, T>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -631,7 +647,7 @@ impl<'a, T> IntoIterator for &'a ConsumeSlice<'a, T> {
 
 impl<'a, T> IntoIterator for &'a mut ConsumeSlice<'a, T> {
     type Item = &'a mut T;
-    type IntoIter = std::slice::IterMut<'a, T>;
+    type IntoIter = core::slice::IterMut<'a, T>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
