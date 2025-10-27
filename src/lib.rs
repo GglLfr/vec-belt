@@ -12,6 +12,7 @@ use alloc::{
 };
 use core::{
     cell::UnsafeCell,
+    fmt,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::{Deref, DerefMut},
@@ -92,6 +93,14 @@ pub struct VecBelt<T> {
     tail: UnsafeCell<NonNull<Fragment<T>>>,
 }
 
+impl<T> fmt::Debug for VecBelt<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(core::any::type_name::<T>())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// # Safety
 ///
 /// [`VecBelt<T>`] provides synchronization primitives that won't lead to data races.
@@ -121,26 +130,26 @@ impl<T> VecBelt<T> {
     /// Reads the length of the vector atomically. Prefer [`len_mut`](Self::len_mut) if possible.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len.load(Relaxed)
+        self.len.load(Relaxed) & MASK
     }
 
     /// Tests whether the vector is empty atomically. Prefer [`is_empty_mut`](Self::is_empty_mut) if
     /// possible.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len.load(Relaxed) == 0
+        self.len.load(Relaxed) & MASK == 0
     }
 
     /// Reads the length of the vector non-atomically via `&mut self`.
     #[inline]
     pub fn len_mut(&mut self) -> usize {
-        *self.len.get_mut()
+        *self.len.get_mut() & MASK
     }
 
     /// Tests whether the vector is empty non-atomically via `&mut self`.
     #[inline]
     pub fn is_empty_mut(&mut self) -> bool {
-        *self.len.get_mut() == 0
+        *self.len.get_mut() & MASK == 0
     }
 
     /// Extends the vector by `additional` elements, returning an uninitialized slice to it and the
